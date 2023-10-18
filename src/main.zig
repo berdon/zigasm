@@ -2,7 +2,7 @@ const std = @import("std");
 const tk = @import("tokenizer/tokenizer.zig");
 const lx = @import("lexer/lexer.zig");
 const x86_64Cpu = @import("cpu/x86_64Cpu.zig").x86_64Cpu;
-const x86_64Generator = @import("generation/x86_64/x86_64Generator.zig").x86_64Generator;
+const x86_64Generator = @import("generation/x86_64Generator.zig").x86_64Generator;
 
 pub fn main() anyerror!void {
     var allocator = std.heap.page_allocator;
@@ -19,7 +19,6 @@ pub fn main() anyerror!void {
     const outputFile = args[2];
 
     const CpuType = x86_64Cpu();
-    const GeneratorType = x86_64Generator();
     const TokenizerType = tk.tokenizer();
     var cpu = try CpuType.init(allocator);
     var tokenizerError: ?tk.TokenizerError = undefined;
@@ -30,7 +29,7 @@ pub fn main() anyerror!void {
     var lexer = try lx.lexer(
         TokenizerType,
         CpuType,
-        GeneratorType,
+        x86_64Generator,
     ).init(&cpu, &tokenizer, allocator, outputFile);
     defer lexer.deinit();
     errdefer lexer.deinit();

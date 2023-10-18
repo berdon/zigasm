@@ -1,9 +1,8 @@
 const std = @import("std");
-const generator = @import("../../generation/generator.zig");
-const tokenizer = @import("../../tokenizer/tokenizer.zig");
-const lexer = @import("../../lexer/lexer.zig");
-const CPU = @import("../../cpu/cpu.zig");
-const x86_64CPU = @import("../../cpu/x86_64Cpu.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
+const lexer = @import("../lexer/lexer.zig");
+const CPU = @import("../cpu/cpu.zig");
+const x86_64CPU = @import("../cpu/x86_64Cpu.zig");
 const x86_64Cpu = x86_64CPU.x86_64Cpu;
 const x86_64Register = x86_64CPU.Register;
 const x86_64Registers = x86_64CPU.x86_64Registers;
@@ -16,24 +15,36 @@ pub const GeneratorError = struct {
     message: []const u8,
     location: ?tokenizer.Location,
 };
+pub const Symbol = struct {
+    name: []const u8,
+    address: usize,
+};
+const WriterType = std.fs.File.Writer;
 const x86_64CpuType = x86_64Cpu();
 
-pub const x86_64GeneratorContext = struct {
+pub const x86_64Generator = struct {
     const Self = @This();
 
-    allocator: std.mem.Allocator,
-    cpu: *x86_64CpuType,
-    addressOrigin: usize = 0,
     addressCounter: usize = 0,
+    addressOrigin: usize = 0,
+    allocator: std.mem.Allocator = undefined,
     availableExtensions: []const x86_64CPU.Extensions = &[_]x86_64CPU.Extensions{},
     bitMode: CPU.BitModes = .Bit16,
+    cpu: *x86_64CpuType,
     err: ?GeneratorError = undefined,
+    filePath: []const u8,
+    file: ?std.fs.File = null,
+    labels: std.StringHashMap(Symbol) = undefined,
+    writer: ?WriterType = null,
 
-    pub fn init(allocator: std.mem.Allocator, cpu: *x86_64CpuType) anyerror!Self {
-        return .{
+    pub fn init(allocator: std.mem.Allocator, cpu: *x86_64CpuType, filePath: []const u8) Self {
+        var result = Self{
+            .filePath = filePath,
             .allocator = allocator,
             .cpu = cpu,
         };
+        result.labels = @TypeOf(result.labels).init(allocator);
+        return result;
     }
 
     pub fn getCpuType() type {
@@ -41,11 +52,28 @@ pub const x86_64GeneratorContext = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        _ = self;
+        for (self.labels.valueIterator().next()) |value| self.allocator.free(value.name);
+        self.labels.deinit();
+        if (self.file) |file| {
+            file.close();
+        }
     }
 
-    pub fn setAddressCounter(self: *Self, address: usize) void {
-        self.addressOrigin = address;
+    fn getWriter(self: *Self) Errors!WriterType {
+        if (self.writer) |writer| {
+            return writer;
+        }
+        self.file = std.fs.createFileAbsolute(self.filePath, .{ .read = true }) catch {
+            return GeneratorErrors.InternalException;
+        };
+        self.writer = self.file.?.writer();
+        return self.writer.?;
+    }
+
+    pub fn processLabel(self: *Self, label: tokenizer.Token) anyerror!void {
+        var nameBuffer = try self.allocator.alloc(u8, label.lexeme.len);
+        std.mem.copy(u8, nameBuffer, label.lexeme);
+        try self.labels.put(label.lexeme, .{ .name = nameBuffer, .address = self.addressCounter });
     }
 
     pub fn processRawInstruction(self: *Self, mnemonic: tokenizer.Token, operands: std.ArrayList(lexer.Operand)) GeneratorErrors!void {
@@ -59,27 +87,27 @@ pub const x86_64GeneratorContext = struct {
     }
 
     pub fn processSetOriginDirective(self: *Self, origin: usize) GeneratorErrors!void {
-        self.addressCounter = origin;
+        self.addressOrigin = origin;
     }
 
-    pub fn emitBytes(self: *Self, writer: anytype, bytes: []const u8) GeneratorErrors!void {
-        _ = writer.write(bytes) catch return self.createError(Errors.InternalException, "Failed emitting bytes.", null);
+    pub fn emitBytes(self: *Self, bytes: []const u8) GeneratorErrors!void {
+        _ = (try self.getWriter()).write(bytes) catch return self.createError(Errors.InternalException, "Failed emitting bytes.", null);
         self.addressCounter += bytes.len;
     }
 
-    pub fn emitAssignment(self: *Self, writer: anytype, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    pub fn emitAssignment(self: *Self, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         if (leftValue.accessType == .direct and @as(lexer.ValueType, leftValue.value) == .identifier) {
-            try self.emitRegisterAssignment(writer, leftValue, rightValue, location);
+            try self.emitRegisterAssignment(leftValue, rightValue, location);
         } else if (leftValue.accessType == .indirect and @as(lexer.ValueType, leftValue.value) == .constant) {
-            try self.emitMemoryAssignment(writer, leftValue, rightValue, location);
+            try self.emitMemoryAssignment(leftValue, rightValue, location);
         }
     }
 
-    pub fn emitJump(self: *Self, writer: anytype, operand: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
-        return JMP.emitJump(self, writer, operand, location);
+    pub fn emitJump(self: *Self, operand: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+        return JMP.emitJump(self, operand, location);
     }
 
-    fn emitRegisterAssignment(self: *Self, writer: anytype, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitRegisterAssignment(self: *Self, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         const sourceRegister = self.cpu.resolveRegister(leftValue.value.identifier) orelse return Errors.InternalException;
         const rightValueBits: CPU.BitSizes = switch (rightValue.value) {
             .constant => try self.countBits(rightValue.value.constant, location),
@@ -91,25 +119,24 @@ pub const x86_64GeneratorContext = struct {
         }
 
         if (rightValue.accessType == .direct and @as(lexer.ValueType, rightValue.value) == .constant) {
-            try self.emitRegisterAssignmentImmediate(writer, sourceRegister, rightValue, location);
+            try self.emitRegisterAssignmentImmediate(sourceRegister, rightValue, location);
         } else if (rightValue.accessType == .direct and @as(lexer.ValueType, rightValue.value) == .identifier) {
-            try self.emitRegisterAssignmentRegister(writer, sourceRegister, rightValue, location);
+            try self.emitRegisterAssignmentRegister(sourceRegister, rightValue, location);
         } else if (rightValue.accessType == .indirect and @as(lexer.ValueType, rightValue.value) == .constant) {
-            try self.emitRegisterAssignmentMemory(writer, sourceRegister, rightValue, location);
+            try self.emitRegisterAssignmentMemory(sourceRegister, rightValue, location);
         } else if (rightValue.accessType == .indirect and @as(lexer.ValueType, rightValue.value) == .identifier) {
-            try self.emitRegisterAssignmentRegisterOffset(writer, sourceRegister, rightValue, location);
+            try self.emitRegisterAssignmentRegisterOffset(sourceRegister, rightValue, location);
         }
     }
 
-    fn emitMemoryAssignment(self: *Self, writer: anytype, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitMemoryAssignment(self: *Self, leftValue: lexer.Operand, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         _ = location;
         _ = rightValue;
         _ = leftValue;
-        _ = writer;
         _ = self;
     }
 
-    fn emitRegisterAssignmentImmediate(self: *Self, writer: anytype, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitRegisterAssignmentImmediate(self: *Self, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         if (!destination.supportedByBitMode(self.bitMode)) {
             return self.createFormattedError(
                 Errors.RegisterNotSupportedInBitMode,
@@ -131,7 +158,7 @@ pub const x86_64GeneratorContext = struct {
                     return self.createError(Errors.InternalException, "Failed to combine slices.", location);
                 };
                 defer self.allocator.free(result);
-                try self.emitBytes(writer, result);
+                try self.emitBytes(result);
             },
             .Bits16 => {
                 var valueBuffer = try self.bytesFromValue(rightValue.value.constant, 2, location);
@@ -144,7 +171,7 @@ pub const x86_64GeneratorContext = struct {
                     return self.createError(Errors.InternalException, "Failed to combine slices.", location);
                 };
                 defer self.allocator.free(result);
-                try self.emitBytes(writer, result);
+                try self.emitBytes(result);
             },
             .Bits32 => {
                 var valueBuffer = try self.bytesFromValue(rightValue.value.constant, 4, location);
@@ -158,33 +185,30 @@ pub const x86_64GeneratorContext = struct {
                     return self.createError(Errors.InternalException, "Failed to combine slices.", location);
                 };
                 defer self.allocator.free(result);
-                try self.emitBytes(writer, result);
+                try self.emitBytes(result);
             },
             else => unreachable,
         }
     }
 
-    fn emitRegisterAssignmentRegister(self: *Self, writer: anytype, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitRegisterAssignmentRegister(self: *Self, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         _ = location;
         _ = rightValue;
         _ = destination;
-        _ = writer;
         _ = self;
     }
 
-    fn emitRegisterAssignmentMemory(self: *Self, writer: anytype, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitRegisterAssignmentMemory(self: *Self, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         _ = location;
         _ = rightValue;
         _ = destination;
-        _ = writer;
         _ = self;
     }
 
-    fn emitRegisterAssignmentRegisterOffset(self: *Self, writer: anytype, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+    fn emitRegisterAssignmentRegisterOffset(self: *Self, destination: x86_64Register, rightValue: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
         _ = location;
         _ = rightValue;
         _ = destination;
-        _ = writer;
         _ = self;
     }
 
@@ -294,7 +318,3 @@ pub const x86_64GeneratorContext = struct {
         return errorType;
     }
 };
-
-pub fn x86_64Generator() type {
-    return generator.generator(x86_64GeneratorContext);
-}

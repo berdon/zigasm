@@ -1,12 +1,12 @@
 const std = @import("std");
-const lexer = @import("../../../lexer/lexer.zig");
-const tokenizer = @import("../../../tokenizer/tokenizer.zig");
+const lexer = @import("../../lexer/lexer.zig");
+const tokenizer = @import("../../tokenizer/tokenizer.zig");
 const Errors = @import("../x86_64Generator.zig").Errors;
 const GeneratorErrors = @import("../x86_64Generator.zig").GeneratorErrors;
-const cpu = @import("../../../cpu/cpu.zig");
-const utils = @import("../../utils.zig");
+const cpu = @import("../../cpu/cpu.zig");
+const utils = @import("../utils.zig");
 
-pub fn emitJump(self: anytype, writer: anytype, operand: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
+pub fn emitJump(self: anytype, operand: lexer.Operand, location: tokenizer.Location) GeneratorErrors!void {
     if (operand.accessType == .direct and @as(lexer.ValueType, operand.value) == .constant) {
         var valueByteSize = self.getValueSizeFromBitMode();
         var constantByteSize = try self.countBytes(operand.value.constant, location);
@@ -31,6 +31,6 @@ pub fn emitJump(self: anytype, writer: anytype, operand: lexer.Operand, location
         };
         defer self.allocator.free(result);
 
-        try self.emitBytes(writer, result);
+        try self.emitBytes(result);
     }
 }

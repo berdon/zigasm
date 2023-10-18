@@ -64,7 +64,7 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
         pub fn init(cpu: *CpuType, tokenizer: *TokenizerType, allocator: Allocator, filePath: []const u8) anyerror!Self {
             var result = Self{
                 .cpu = cpu,
-                .generator = try GeneratorType.init(allocator, cpu, filePath),
+                .generator = GeneratorType.init(allocator, cpu, filePath),
                 .tokenizer = tokenizer,
                 .allocator = allocator,
             };
@@ -268,7 +268,7 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
                 ValueType.constant => {
                     std.log.info("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.constant });
                     self.generator.emitAssignment(leftValue, value, location) catch {
-                        return self.createError(Errors.GeneratorError, self.generator.generator.err.?.message, self.generator.generator.err.?.location);
+                        return self.createError(Errors.GeneratorError, self.generator.err.?.message, self.generator.err.?.location);
                     };
                 },
                 ValueType.identifier => std.log.info("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.identifier }),
