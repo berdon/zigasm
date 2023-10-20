@@ -15,6 +15,7 @@ pub const TokenType = enum {
     SymbolAt,
     SymbolAsterisk,
     SymbolColon,
+    SymbolComma,
     SymbolDoubleQuote,
     SymbolEquals,
     SymbolForwardSlash,
@@ -22,8 +23,16 @@ pub const TokenType = enum {
     SymbolMinus,
     SymbolPlus,
     SymbolRightParanthesis,
+    SymbolSemicolon,
+    ReservedBytes,
+    ReservedCurrent,
+    ReservedDoubleWords,
+    ReservedQuadWords,
+    ReservedPadBytes,
     ReservedSetBitMode,
     ReservedSetOrigin,
+    ReservedStart,
+    ReservedWords,
     InstructionJmp,
     NewLine,
     EOF,
@@ -58,14 +67,23 @@ const SymbolAsterisk: u8 = '*';
 const SymbolAt: u8 = '@';
 const SymbolPlus: u8 = '+';
 const SymbolMinus: u8 = '-';
+const SymbolComma: u8 = ',';
 const SymbolColon: u8 = ':';
 const SymbolForwardSlash: u8 = '/';
 const SymbolNewLine: u8 = '\n';
 const SymbolDoubleQuote: u8 = '\"';
 const SymbolLeftParanthesis: u8 = '(';
 const SymbolRightParanthesis: u8 = ')';
+const SymbolSemicolon: u8 = ';';
+const ReservedBytes: []const u8 = "Bytes";
+const ReservedCurrent: []const u8 = "Current";
+const ReservedDoubleWords: []const u8 = "DoubleWords";
+const ReservedQuadWords: []const u8 = "QuadWords";
+const ReservedPadBytes: []const u8 = "PadBytes";
 const ReservedSetBitMode: []const u8 = "SetBitMode";
 const ReservedSetOrigin: []const u8 = "SetOrigin";
+const ReservedStart: []const u8 = "Origin";
+const ReservedWords: []const u8 = "Words";
 const InstructionJmp: []const u8 = "jmp";
 
 const ByteClassification = struct {
@@ -105,6 +123,7 @@ pub fn tokenizer() type {
     return struct {
         const Self = @This();
 
+        err: ?TokenizerError,
         file: File,
         fileReader: std.io.BufferedReader(4096, File.Reader),
         allocator: Allocator,
@@ -126,18 +145,28 @@ pub fn tokenizer() type {
             try symbols.put(SymbolAt, .SymbolAt);
             try symbols.put(SymbolPlus, .SymbolPlus);
             try symbols.put(SymbolMinus, .SymbolMinus);
+            try symbols.put(SymbolComma, .SymbolComma);
             try symbols.put(SymbolColon, .SymbolColon);
             try symbols.put(SymbolForwardSlash, .SymbolForwardSlash);
             try symbols.put(SymbolNewLine, .NewLine);
             try symbols.put(SymbolDoubleQuote, .SymbolDoubleQuote);
             try symbols.put(SymbolLeftParanthesis, .SymbolLeftParanthesis);
             try symbols.put(SymbolRightParanthesis, .SymbolRightParanthesis);
+            try symbols.put(SymbolSemicolon, .SymbolSemicolon);
             var reservedWords = std.StringHashMap(TokenType).init(allocator);
+            try reservedWords.put(ReservedBytes, .ReservedBytes);
+            try reservedWords.put(ReservedCurrent, .ReservedCurrent);
+            try reservedWords.put(ReservedDoubleWords, .ReservedDoubleWords);
+            try reservedWords.put(ReservedPadBytes, .ReservedPadBytes);
+            try reservedWords.put(ReservedQuadWords, .ReservedQuadWords);
             try reservedWords.put(ReservedSetBitMode, .ReservedSetBitMode);
             try reservedWords.put(ReservedSetOrigin, .ReservedSetOrigin);
+            try reservedWords.put(ReservedStart, .ReservedStart);
+            try reservedWords.put(ReservedWords, .ReservedWords);
             var instructions = std.StringHashMap(TokenType).init(allocator);
             try instructions.put(InstructionJmp, .InstructionJmp);
             return .{
+                .err = null,
                 .file = file,
                 .fileReader = fileReader,
                 .allocator = allocator,
@@ -152,6 +181,13 @@ pub fn tokenizer() type {
             self.symbols.deinit();
             self.reservedWords.deinit();
             self.instructions.deinit();
+        }
+
+        pub fn reinit(self: *Self) TokenizerErrors!void {
+            self.file.seekTo(0) catch return self.createError(Errors.InternalError, "Failed to seek to file beginning.", &self.err);
+            self.fileReader = std.io.bufferedReader(self.file.reader());
+            self.nextByte = null;
+            self.isEndOfFile = false;
         }
 
         pub fn next(self: *Self, err: *?TokenizerError) TokenizerErrors!Token {
@@ -169,6 +205,9 @@ pub fn tokenizer() type {
                         token = self.createToken(.NewLine, self.buffer[0..1]);
                     } else if (peek == SymbolDoubleQuote) {
                         token = try self.readStringLiteral(reader, err);
+                    } else if (peek == SymbolSemicolon) {
+                        try self.readComment(reader, err);
+                        continue;
                     } else if (peek == SymbolForwardSlash) {
                         try self.skipByte(reader, err);
                         if (try self.peekByte(reader, err)) |pb2| {
@@ -214,11 +253,11 @@ pub fn tokenizer() type {
                         // Pass
                         isHex = pb == 'x';
                         isBinary = pb == 'b';
-                    } else if (pb == ',' or pb == '_') {
-                        // Peek was already a number
-                        if (pos == 0) unreachable;
-                        if (self.buffer[pos - 1] == ',' or self.buffer[pos - 1] == '_')
-                            return self.createError(Errors.InvalidNumber, "Cannot use multiple number separators in a row.", err);
+                        // } else if (pb == ',' or pb == '_') {
+                        //     // Peek was already a number
+                        //     if (pos == 0) unreachable;
+                        //     if (self.buffer[pos - 1] == ',' or self.buffer[pos - 1] == '_')
+                        //         return self.createError(Errors.InvalidNumber, "Cannot use multiple number separators in a row.", err);
                     } else if (!u8util.isNumeric(pb) and !(isHex and u8util.isHexDigit(pb)) and !(isBinary and u8util.isBinaryDigit(pb))) {
                         return self.createToken(.Number, self.buffer[0..pos]);
                     }

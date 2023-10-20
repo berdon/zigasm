@@ -76,6 +76,12 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
             _ = self;
         }
 
+        pub fn nextPass(self: *Self) LexerErrors!void {
+            self.tokenizer.*.reinit() catch return self.createError(Errors.InternalException, "Failed to reinitialize tokenizer.", null);
+            self.generator.nextPass() catch return self.createError(Errors.InternalException, "There are only two passes.", null);
+            self.nextToken = null;
+        }
+
         pub fn parse(self: *Self) LexerErrors!void {
             while (true) {
                 const peek = try self.peekToken();
@@ -106,11 +112,11 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
                     defer labelToken.deinit();
                     self.currentIndent = @intCast(peek.location.column);
                     self.currentIndent += 2;
-                    self.generator.processLabel(labelToken) catch |e| {
+                    self.generator.processLabel(labelToken.lexeme, labelToken.location) catch |e| {
                         return self.createFormattedError(Errors.GeneratorError, "Failed to process label, \"{s}\" with Generator Error {}.", .{ labelToken.lexeme, e }, labelToken.location);
                     };
                     try self.skipOne(.SymbolColon, null);
-                    std.log.info("Found {s} label.", .{labelToken.lexeme});
+                    std.log.debug("Found {s} label.", .{labelToken.lexeme});
 
                     peek = try self.peekToken();
                     if (peek.type == .EOF) {
@@ -152,10 +158,33 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
             defer directive.deinit();
 
             switch (directive.type) {
+                .ReservedBytes => try self.parseBytesDirective(directive),
+                .ReservedCurrent => unreachable,
+                .ReservedDoubleWords => try self.parseDoubleWordsDirective(directive),
+                .ReservedPadBytes => try self.parsePadBytesDirective(directive),
+                .ReservedQuadWords => try self.parseQuadWordsDirective(directive),
                 .ReservedSetBitMode => try self.parseSetBitModeDirective(),
                 .ReservedSetOrigin => try self.parseSetOriginDirective(),
+                .ReservedWords => try self.parseWordsDirective(directive),
                 else => return self.createFormattedError(Errors.InvalidDirective, "Invalid or unknown directive: \"{s}\".", .{directive.lexeme}, directive.location),
             }
+        }
+
+        fn parsePadBytesDirective(self: *Self, directiveToken: Token) LexerErrors!void {
+            try self.skipOne(.SymbolLeftParanthesis, null);
+            var result = try self.parseConstantExpression();
+            var byteValue: u8 = 0x00;
+            if ((try self.peekToken()).type == .SymbolComma) {
+                try self.skipOne(.SymbolComma, null);
+                var byteToken = try self.expect(.Number, null);
+                byteValue = std.fmt.parseInt(u8, byteToken.lexeme, 0) catch {
+                    return self.createFormattedError(Errors.InternalException, "Failed to parse byte value, \"{s}\".", .{byteToken.lexeme}, byteToken.location);
+                };
+            }
+            try self.skipOne(.SymbolRightParanthesis, null);
+            self.generator.processPadBytesDirective(@intCast(result), byteValue) catch {
+                return self.createFormattedError(Errors.InternalException, "Failed to process pad bytes directive.", .{}, directiveToken.location);
+            };
         }
 
         /// TODO: Probably delegate CPU specific directives to the generator
@@ -177,6 +206,38 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
 
             const origin = try self.parseNumberValue(usize, originText.lexeme, originText.location);
             self.generator.processSetOriginDirective(origin) catch |ge| return self.errorFromGeneratorError(ge, "Failed to set origin to {}.", .{origin}, originText.location);
+        }
+
+        fn parseBytesDirective(self: *Self, directiveToken: Token) LexerErrors!void {
+            _ = directiveToken;
+            _ = self;
+        }
+
+        fn parseWordsDirective(self: *Self, directiveToken: Token) LexerErrors!void {
+            _ = directiveToken;
+            _ = self;
+        }
+
+        fn parseDoubleWordsDirective(self: *Self, directiveToken: Token) LexerErrors!void {
+            _ = directiveToken;
+
+            try self.skipOne(.SymbolLeftParanthesis, null);
+            while ((try self.peekToken()).type != .SymbolRightParanthesis) {
+                var doubleWordToken = try self.expect(.Number, null);
+                var doubleWord = std.fmt.parseInt(u32, doubleWordToken.lexeme, 0) catch {
+                    return self.createFormattedError(Errors.InternalException, "Failed to parse double word, \"{s}\".", .{doubleWordToken.lexeme}, doubleWordToken.location);
+                };
+                self.generator.emitDoubleWord(doubleWord) catch {
+                    return self.createFormattedError(Errors.InternalException, "Failed to emit double word, {d}.", .{doubleWord}, doubleWordToken.location);
+                };
+                try self.skipAtMost(.SymbolComma, null, 1);
+            }
+            try self.skipOne(.SymbolRightParanthesis, null);
+        }
+
+        fn parseQuadWordsDirective(self: *Self, directiveToken: Token) LexerErrors!void {
+            _ = directiveToken;
+            _ = self;
         }
 
         fn parseExpression(self: *Self, token: Token) LexerErrors!void {
@@ -266,13 +327,62 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
             defer value.deinit();
             switch (value.value) {
                 ValueType.constant => {
-                    std.log.info("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.constant });
+                    std.log.debug("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.constant });
                     self.generator.emitAssignment(leftValue, value, location) catch {
                         return self.createError(Errors.GeneratorError, self.generator.err.?.message, self.generator.err.?.location);
                     };
                 },
-                ValueType.identifier => std.log.info("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.identifier }),
+                ValueType.identifier => std.log.debug("{} = [{}:{s}]", .{ leftValue.value, value.accessType, value.value.identifier }),
             }
+        }
+
+        fn parseConstantExpression(self: *Self) LexerErrors!isize {
+            // constant | [(] constantExpression [)] | constant (+|-|*|/) constantExpression)
+            var peek = try self.peekToken();
+            if (peek.type == .SymbolLeftParanthesis) {
+                var result = try self.parseConstantExpression();
+                try self.skipOne(.SymbolRightParanthesis, null);
+                return result;
+            }
+
+            var leftOperand = try self.parseValue();
+            defer leftOperand.deinit();
+
+            peek = try self.peekToken();
+            switch (peek.type) {
+                // constant (+|-|*|/) constantExpression
+                .SymbolPlus, .SymbolMinus, .SymbolAsterisk, .SymbolForwardSlash => {
+                    var operator = try self.readToken();
+                    defer operator.deinit();
+
+                    var secondaryOperand = try self.parseConstantExpression();
+                    return self.evaluateConstantExpression(
+                        try self.evaluateConstant(leftOperand, leftOperand.token.?.location),
+                        operator.lexeme[0],
+                        secondaryOperand,
+                    );
+                },
+                // constant
+                else => return try self.evaluateConstant(leftOperand, leftOperand.token.?.location),
+            }
+        }
+
+        fn evaluateConstantExpression(self: *Self, leftOperand: isize, operator: u8, rightOperand: isize) isize {
+            _ = self;
+            return switch (operator) {
+                '+' => leftOperand + rightOperand,
+                '-' => leftOperand - rightOperand,
+                '*' => leftOperand * rightOperand,
+                '/' => @divFloor(leftOperand, rightOperand),
+                else => unreachable,
+            };
+        }
+
+        fn evaluateConstant(self: *Self, operand: Operand, location: ?Location) LexerErrors!isize {
+            if (operand.accessType != .direct or @as(ValueType, operand.value) != .constant) unreachable;
+            return std.fmt.parseInt(isize, operand.value.constant, 0) catch {
+                return self.createFormattedError(Errors.InternalException, "Failed to evaluate constant, \"{s}\".", .{operand.value.constant}, location);
+            };
         }
 
         fn parseValue(self: *Self) LexerErrors!Operand {
@@ -297,6 +407,28 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
                     var identifierToken = try token.clone(self.allocator, &self.tokenizerError);
                     return .{ .accessType = .direct, .value = .{ .identifier = identifierToken.lexeme }, .token = identifierToken };
                 },
+                .SymbolAt => {
+                    var valueDirective = try self.readToken();
+                    try self.skipOne(.SymbolLeftParanthesis, null);
+                    try self.skipOne(.SymbolRightParanthesis, null);
+                    switch (valueDirective.type) {
+                        .ReservedCurrent => {
+                            self.allocator.free(valueDirective.lexeme);
+                            valueDirective.lexeme = std.fmt.allocPrint(self.allocator, "0x{X}", .{self.generator.currentAddress()}) catch {
+                                return self.createFormattedError(Errors.InternalException, "Failed to generator value directive lexeme.", .{}, valueDirective.location);
+                            };
+                            return .{ .accessType = .direct, .value = .{ .constant = valueDirective.lexeme }, .token = valueDirective };
+                        },
+                        .ReservedStart => {
+                            self.allocator.free(valueDirective.lexeme);
+                            valueDirective.lexeme = std.fmt.allocPrint(self.allocator, "0x{X}", .{self.generator.addressOrigin}) catch {
+                                return self.createFormattedError(Errors.InternalException, "Failed to generator value directive lexeme.", .{}, valueDirective.location);
+                            };
+                            return .{ .accessType = .direct, .value = .{ .constant = valueDirective.lexeme }, .token = valueDirective };
+                        },
+                        else => unreachable,
+                    }
+                },
                 else => return self.createFormattedError(Errors.UnexpectedToken, "Invalid r-value in assigment ({s}).", .{token.lexeme}, token.location),
             }
         }
@@ -312,6 +444,14 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
 
         fn skipMany(self: *Self, tokenType: TokenType, lexeme: ?[]const u8, count: u8) LexerErrors!void {
             for (0..count) |_| try self.skipOne(tokenType, lexeme);
+        }
+
+        fn skipAny(self: *Self, tokenType: TokenType, lexeme: ?[]const u8) LexerErrors!void {
+            while ((try self.peekToken()).type == tokenType) {
+                var adsf = try self.peekToken();
+                _ = adsf;
+                try self.skipOne(tokenType, lexeme);
+            }
         }
 
         fn skipAtMost(self: *Self, tokenType: TokenType, lexeme: ?[]const u8, count: u8) LexerErrors!void {
@@ -351,7 +491,7 @@ pub fn lexer(comptime TokenizerType: type, comptime CpuType: type, comptime Gene
         fn _readToken(self: *Self) LexerErrors!Token {
             var tokenizerError: ?TokenizerError = undefined;
             return self.tokenizer.next(&tokenizerError) catch |err| {
-                std.log.info("[{}]:{d}:{d} {s}\n\r", .{ tokenizerError.?.err, tokenizerError.?.location.line, tokenizerError.?.location.column, tokenizerError.?.message });
+                std.log.debug("[{}]:{d}:{d} {s}\n\r", .{ tokenizerError.?.err, tokenizerError.?.location.line, tokenizerError.?.location.column, tokenizerError.?.message });
                 return err;
             };
         }

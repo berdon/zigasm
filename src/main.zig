@@ -34,15 +34,21 @@ pub fn main() anyerror!void {
     defer lexer.deinit();
     errdefer lexer.deinit();
 
-    _ = lexer.parse() catch |e| {
-        if (lexer.err) |err| {
-            if (err.location) |location| {
-                std.log.info("[{}]:{d}:{d} {s}\n\r", .{ err.err, location.line, location.column, err.message });
+    var completedFirstPass = false;
+    while (true) {
+        _ = lexer.parse() catch |e| {
+            if (lexer.err) |err| {
+                if (err.location) |location| {
+                    std.log.info("[{}]:{d}:{d} {s}\n\r", .{ err.err, location.line, location.column, err.message });
+                } else {
+                    std.log.info("[{}]:unknown {s}\n\r", .{ err.err, err.message });
+                }
             } else {
-                std.log.info("[{}]:unknown {s}\n\r", .{ err.err, err.message });
+                std.log.info("Unexpected exception: {}\n\r", .{e});
             }
-        } else {
-            std.log.info("Unexpected exception: {}\n\r", .{e});
-        }
-    };
+        };
+        if (completedFirstPass) break;
+        completedFirstPass = true;
+        try lexer.nextPass();
+    }
 }
